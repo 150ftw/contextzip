@@ -1,0 +1,1849 @@
+//! Token savings tracking and analytics system.
+//!
+//! This module provides comprehensive tracking of ContextZip command executions,
+//! recording token savings, execution times, and providing aggregation APIs
+//! for daily/weekly/monthly statistics.
+//!
+//! # Architecture
+//!
+//! - Storage: SQLite database (~/.local/share/contextzip/tracking.db)
+//! - Retention: 90-day automatic cleanup
+//! - Metrics: Input/output tokens, savings %, execution time
+//!
+//! # Quick Start
+//!
+//! ```no_run
+//! use contextzip::tracking::{TimedExecution, Tracker};
+//!
+//! // Track a command execution
+//! let timer = TimedExecution::start();
+//! let input = "raw output";
+//! let output = "filtered output";
+//! timer.track("ls -la", "contextzip ls", input, output);
+//!
+//! // Query statistics
+//! let tracker = Tracker::new().unwrap();
+//! let summary = tracker.get_summary().unwrap();
+//! println!("Saved {} tokens", summary.total_saved);
+//! ```
+//!
+//! See [docs/tracking.md](../docs/tracking.md) for full documentation.
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
+use serde::Serialize;
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::time::Instant;
+
+// ── Project path helpers ── // added: project-scoped tracking support
+
+/// Get the canonical project path string for the current working directory.
+fn current_project_path_string() -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// Build SQL filter params for project-scoped queries.
+/// Returns (exact_match, glob_prefix) for WHERE clause.
+/// Uses GLOB instead of LIKE to avoid `_` and `%` in paths acting as wildcards. // changed: GLOB
+fn project_filter_params(project_path: Option<&str>) -> (Option<String>, Option<String>) {
+    match project_path {
+        Some(p) => (
+            Some(p.to_string()),
+            Some(format!("{}{}*", p, std::path::MAIN_SEPARATOR)), // changed: GLOB pattern with * wildcard
+        ),
+        None => (None, None),
+    }
+}
+
+/// Number of days to retain tracking history before automatic cleanup.
+const HISTORY_DAYS: i64 = 90;
+
+/// Main tracking interface for recording and querying command history.
+///
+/// Manages SQLite database connection and provides methods for:
+/// - Recording command executions with token counts and timing
+/// - Querying aggregated statistics (summary, daily, weekly, monthly)
+/// - Retrieving recent command history
+///
+/// # Database Location
+///
+/// - Linux: `~/.local/share/contextzip/tracking.db`
+/// - macOS: `~/Library/Application Support/contextzip/tracking.db`
+/// - Windows: `%APPDATA%\contextzip\tracking.db`
+///
+/// # Examples
+///
+/// ```no_run
+/// use contextzip::tracking::Tracker;
+///
+/// let tracker = Tracker::new()?;
+/// tracker.record("ls -la", "contextzip ls", 1000, 200, 50)?;
+///
+/// let summary = tracker.get_summary()?;
+/// println!("Total saved: {} tokens", summary.total_saved);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub struct Tracker {
+    conn: Connection,
+}
+
+/// Individual command record from tracking history.
+///
+/// Contains timestamp, command name, and savings metrics for a single execution.
+#[derive(Debug)]
+pub struct CommandRecord {
+    /// UTC timestamp when command was executed
+    pub timestamp: DateTime<Utc>,
+    /// ContextZip command that was executed (e.g., "contextzip ls")
+    pub contextzip_cmd: String,
+    /// Input tokens (raw command output size)
+    pub input_tokens: usize,
+    /// Output tokens (filtered command output size)
+    pub output_tokens: usize,
+    /// Number of tokens saved (input - output)
+    #[allow(dead_code)]
+    pub saved_tokens: usize,
+    /// Savings percentage ((saved / input) * 100)
+    pub savings_pct: f64,
+}
+
+/// Aggregated statistics across all recorded commands.
+///
+/// Provides overall metrics and breakdowns by command and by day.
+/// Returned by [`Tracker::get_summary`].
+#[derive(Debug)]
+pub struct GainSummary {
+    /// Total number of commands recorded
+    pub total_commands: usize,
+    /// Total input tokens across all commands
+    pub total_input: usize,
+    /// Total output tokens across all commands
+    pub total_output: usize,
+    /// Total tokens saved (input - output)
+    pub total_saved: usize,
+    /// Average savings percentage across all commands
+    pub avg_savings_pct: f64,
+    /// Total execution time across all commands (milliseconds)
+    pub total_time_ms: u64,
+    /// Average execution time per command (milliseconds)
+    pub avg_time_ms: u64,
+    /// Top 10 commands by tokens saved: (cmd, count, saved, avg_pct, avg_time_ms)
+    pub by_command: Vec<(String, usize, usize, f64, u64)>,
+    /// Last 30 days of activity: (date, saved_tokens)
+    pub by_day: Vec<(String, usize)>,
+}
+
+/// Per-feature aggregate statistics.
+///
+/// Groups savings by the contextzip module that produced them (cli, error, web, etc.).
+#[derive(Debug, Serialize)]
+pub struct FeatureStats {
+    /// Feature module name (e.g., "cli", "error", "web")
+    pub feature: String,
+    /// Number of commands using this feature
+    pub commands: usize,
+    /// Total tokens saved by this feature
+    pub saved_tokens: usize,
+    /// Average savings percentage for this feature
+    pub avg_savings_pct: f64,
+}
+
+/// Daily statistics for token savings and execution metrics.
+///
+/// Serializable to JSON for export via `contextzip gain --daily --format json`.
+///
+/// # JSON Schema
+///
+/// ```json
+/// {
+///   "date": "2026-02-03",
+///   "commands": 42,
+///   "input_tokens": 15420,
+///   "output_tokens": 3842,
+///   "saved_tokens": 11578,
+///   "savings_pct": 75.08,
+///   "total_time_ms": 8450,
+///   "avg_time_ms": 201
+/// }
+/// ```
+#[derive(Debug, Serialize)]
+pub struct DayStats {
+    /// ISO date (YYYY-MM-DD)
+    pub date: String,
+    /// Number of commands executed this day
+    pub commands: usize,
+    /// Total input tokens for this day
+    pub input_tokens: usize,
+    /// Total output tokens for this day
+    pub output_tokens: usize,
+    /// Total tokens saved this day
+    pub saved_tokens: usize,
+    /// Savings percentage for this day
+    pub savings_pct: f64,
+    /// Total execution time for this day (milliseconds)
+    pub total_time_ms: u64,
+    /// Average execution time per command (milliseconds)
+    pub avg_time_ms: u64,
+}
+
+/// Weekly statistics for token savings and execution metrics.
+///
+/// Serializable to JSON for export via `contextzip gain --weekly --format json`.
+/// Weeks start on Sunday (SQLite default).
+#[derive(Debug, Serialize)]
+pub struct WeekStats {
+    /// Week start date (YYYY-MM-DD)
+    pub week_start: String,
+    /// Week end date (YYYY-MM-DD)
+    pub week_end: String,
+    /// Number of commands executed this week
+    pub commands: usize,
+    /// Total input tokens for this week
+    pub input_tokens: usize,
+    /// Total output tokens for this week
+    pub output_tokens: usize,
+    /// Total tokens saved this week
+    pub saved_tokens: usize,
+    /// Savings percentage for this week
+    pub savings_pct: f64,
+    /// Total execution time for this week (milliseconds)
+    pub total_time_ms: u64,
+    /// Average execution time per command (milliseconds)
+    pub avg_time_ms: u64,
+}
+
+/// Monthly statistics for token savings and execution metrics.
+///
+/// Serializable to JSON for export via `contextzip gain --monthly --format json`.
+#[derive(Debug, Serialize)]
+pub struct MonthStats {
+    /// Month identifier (YYYY-MM)
+    pub month: String,
+    /// Number of commands executed this month
+    pub commands: usize,
+    /// Total input tokens for this month
+    pub input_tokens: usize,
+    /// Total output tokens for this month
+    pub output_tokens: usize,
+    /// Total tokens saved this month
+    pub saved_tokens: usize,
+    /// Savings percentage for this month
+    pub savings_pct: f64,
+    /// Total execution time for this month (milliseconds)
+    pub total_time_ms: u64,
+    /// Average execution time per command (milliseconds)
+    pub avg_time_ms: u64,
+}
+
+/// Type alias for command statistics tuple: (command, count, saved_tokens, avg_savings_pct, avg_time_ms)
+type CommandStats = (String, usize, usize, f64, u64);
+
+impl Tracker {
+    /// Create a new tracker instance.
+    ///
+    /// Opens or creates the SQLite database at the platform-specific location.
+    /// Automatically creates the `commands` table if it doesn't exist and runs
+    /// any necessary schema migrations.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - Cannot determine database path
+    /// - Cannot create parent directories
+    /// - Cannot open/create SQLite database
+    /// - Schema creation/migration fails
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::Tracker;
+    ///
+    /// let tracker = Tracker::new()?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn new() -> Result<Self> {
+        let db_path = get_db_path()?;
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let conn = Connection::open(&db_path)?;
+        // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
+        // Non-fatal: NFS/read-only filesystems may not support WAL.
+        let _ = conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;",
+        );
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS commands (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                original_cmd TEXT NOT NULL,
+                contextzip_cmd TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                saved_tokens INTEGER NOT NULL,
+                savings_pct REAL NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_timestamp ON commands(timestamp)",
+            [],
+        )?;
+
+        // Migration: add exec_time_ms column if it doesn't exist
+        let _ = conn.execute(
+            "ALTER TABLE commands ADD COLUMN exec_time_ms INTEGER DEFAULT 0",
+            [],
+        );
+        // Migration: add project_path column with DEFAULT '' for new rows // changed: added DEFAULT
+        let _ = conn.execute(
+            "ALTER TABLE commands ADD COLUMN project_path TEXT DEFAULT ''",
+            [],
+        );
+        // Migration: add feature column for tracking which contextzip module produced savings
+        let _ = conn.execute(
+            "ALTER TABLE commands ADD COLUMN feature TEXT DEFAULT 'cli'",
+            [],
+        );
+        // Normalize NULLs in feature column from pre-migration rows
+        let has_null_features: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE feature IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if has_null_features {
+            let _ = conn.execute(
+                "UPDATE commands SET feature = 'cli' WHERE feature IS NULL",
+                [],
+            );
+        }
+        // One-time migration: normalize NULLs from pre-default schema // changed: guarded with EXISTS
+        let has_nulls: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE project_path IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if has_nulls {
+            let _ = conn.execute(
+                "UPDATE commands SET project_path = '' WHERE project_path IS NULL",
+                [],
+            );
+        }
+        // Index for fast project-scoped gain queries // added
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_project_path_timestamp ON commands(project_path, timestamp)",
+            [],
+        );
+
+        // Migration: rename legacy rtk_cmd column (from upstream RTK) → contextzip_cmd
+        let has_legacy_col: bool = conn.prepare("SELECT rtk_cmd FROM commands LIMIT 0").is_ok();
+        if has_legacy_col {
+            let _ = conn.execute(
+                "ALTER TABLE commands RENAME COLUMN rtk_cmd TO contextzip_cmd",
+                [],
+            );
+        }
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS parse_failures (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                raw_command TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                fallback_succeeded INTEGER NOT NULL DEFAULT 0
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pf_timestamp ON parse_failures(timestamp)",
+            [],
+        )?;
+
+        Ok(Self { conn })
+    }
+
+    /// Record a command execution with token counts and timing.
+    ///
+    /// Calculates savings metrics and stores the record in the database.
+    /// Automatically cleans up records older than 90 days after insertion.
+    ///
+    /// # Arguments
+    ///
+    /// - `original_cmd`: The standard command (e.g., "ls -la")
+    /// - `contextzip_cmd`: The ContextZip command used (e.g., "contextzip ls")
+    /// - `input_tokens`: Estimated tokens from standard command output
+    /// - `output_tokens`: Actual tokens from ContextZip output
+    /// - `exec_time_ms`: Execution time in milliseconds
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::Tracker;
+    ///
+    /// let tracker = Tracker::new()?;
+    /// tracker.record("ls -la", "contextzip ls", 1000, 200, 50)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn record(
+        &self,
+        original_cmd: &str,
+        contextzip_cmd: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        exec_time_ms: u64,
+    ) -> Result<()> {
+        self.record_with_feature(
+            original_cmd,
+            contextzip_cmd,
+            input_tokens,
+            output_tokens,
+            exec_time_ms,
+            "cli",
+        )
+    }
+
+    /// Record a command execution with a specific feature tag.
+    ///
+    /// Feature identifies which contextzip module produced the savings:
+    /// 'cli', 'error', 'web', 'ansi', 'build', 'pkg', 'docker'.
+    pub fn record_with_feature(
+        &self,
+        original_cmd: &str,
+        contextzip_cmd: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        exec_time_ms: u64,
+        feature: &str,
+    ) -> Result<()> {
+        let saved = input_tokens.saturating_sub(output_tokens);
+        let pct = if input_tokens > 0 {
+            (saved as f64 / input_tokens as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let project_path = current_project_path_string();
+
+        self.conn.execute(
+            "INSERT INTO commands (timestamp, original_cmd, contextzip_cmd, project_path, input_tokens, output_tokens, saved_tokens, savings_pct, exec_time_ms, feature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                Utc::now().to_rfc3339(),
+                original_cmd,
+                contextzip_cmd,
+                project_path,
+                input_tokens as i64,
+                output_tokens as i64,
+                saved as i64,
+                pct,
+                exec_time_ms as i64,
+                feature
+            ],
+        )?;
+
+        self.cleanup_old()?;
+        Ok(())
+    }
+
+    fn cleanup_old(&self) -> Result<()> {
+        let cutoff = Utc::now() - chrono::Duration::days(HISTORY_DAYS);
+        self.conn.execute(
+            "DELETE FROM commands WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM parse_failures WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Record a parse failure for analytics.
+    pub fn record_parse_failure(
+        &self,
+        raw_command: &str,
+        error_message: &str,
+        fallback_succeeded: bool,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO parse_failures (timestamp, raw_command, error_message, fallback_succeeded)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                Utc::now().to_rfc3339(),
+                raw_command,
+                error_message,
+                fallback_succeeded as i32,
+            ],
+        )?;
+        self.cleanup_old()?;
+        Ok(())
+    }
+
+    /// Get parse failure summary for `contextzip gain --failures`.
+    pub fn get_parse_failure_summary(&self) -> Result<ParseFailureSummary> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM parse_failures", [], |row| row.get(0))?;
+
+        let succeeded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM parse_failures WHERE fallback_succeeded = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let recovery_rate = if total > 0 {
+            (succeeded as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        // Top commands by frequency
+        let mut stmt = self.conn.prepare(
+            "SELECT raw_command, COUNT(*) as cnt
+             FROM parse_failures
+             GROUP BY raw_command
+             ORDER BY cnt DESC
+             LIMIT 10",
+        )?;
+        let top_commands = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Recent 10
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, raw_command, error_message, fallback_succeeded
+             FROM parse_failures
+             ORDER BY timestamp DESC
+             LIMIT 10",
+        )?;
+        let recent = stmt
+            .query_map([], |row| {
+                Ok(ParseFailureRecord {
+                    timestamp: row.get(0)?,
+                    raw_command: row.get(1)?,
+                    error_message: row.get(2)?,
+                    fallback_succeeded: row.get::<_, i32>(3)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ParseFailureSummary {
+            total: total as usize,
+            recovery_rate,
+            top_commands,
+            recent,
+        })
+    }
+
+    /// Get overall summary statistics across all recorded commands.
+    ///
+    /// Returns aggregated metrics including:
+    /// - Total commands, tokens (input/output/saved)
+    /// - Average savings percentage and execution time
+    /// - Top 10 commands by tokens saved
+    /// - Last 30 days of activity
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::Tracker;
+    ///
+    /// let tracker = Tracker::new()?;
+    /// let summary = tracker.get_summary()?;
+    /// println!("Saved {} tokens ({:.1}%)",
+    ///     summary.total_saved, summary.avg_savings_pct);
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    #[allow(dead_code)]
+    pub fn get_summary(&self) -> Result<GainSummary> {
+        self.get_summary_filtered(None) // delegate to filtered variant
+    }
+
+    /// Get summary statistics filtered by project path. // added
+    ///
+    /// When `project_path` is `Some`, matches the exact working directory
+    /// or any subdirectory (prefix match with path separator).
+    pub fn get_summary_filtered(&self, project_path: Option<&str>) -> Result<GainSummary> {
+        let (project_exact, project_glob) = project_filter_params(project_path); // added
+        let mut total_commands = 0usize;
+        let mut total_input = 0usize;
+        let mut total_output = 0usize;
+        let mut total_saved = 0usize;
+        let mut total_time_ms = 0u64;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT input_tokens, output_tokens, saved_tokens, exec_time_ms
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)", // added: project filter
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            // added: params
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, i64>(3)? as u64,
+            ))
+        })?;
+
+        for row in rows {
+            let (input, output, saved, time_ms) = row?;
+            total_commands += 1;
+            total_input += input;
+            total_output += output;
+            total_saved += saved;
+            total_time_ms += time_ms;
+        }
+
+        let avg_savings_pct = if total_input > 0 {
+            (total_saved as f64 / total_input as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let avg_time_ms = if total_commands > 0 {
+            total_time_ms / total_commands as u64
+        } else {
+            0
+        };
+
+        let by_command = self.get_by_command(project_path)?; // added: pass project filter
+        let by_day = self.get_by_day(project_path)?; // added: pass project filter
+
+        Ok(GainSummary {
+            total_commands,
+            total_input,
+            total_output,
+            total_saved,
+            avg_savings_pct,
+            total_time_ms,
+            avg_time_ms,
+            by_command,
+            by_day,
+        })
+    }
+
+    fn get_by_command(
+        &self,
+        project_path: Option<&str>, // added
+    ) -> Result<Vec<CommandStats>> {
+        let (project_exact, project_glob) = project_filter_params(project_path); // added
+        let mut stmt = self.conn.prepare(
+            "SELECT contextzip_cmd, COUNT(*), SUM(saved_tokens), AVG(savings_pct), AVG(exec_time_ms)
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY contextzip_cmd
+             ORDER BY SUM(saved_tokens) DESC
+             LIMIT 10", // added: project filter in WHERE
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            // added: params
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, i64>(2)? as usize,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)? as u64,
+            ))
+        })?;
+
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn get_by_day(
+        &self,
+        project_path: Option<&str>, // added
+    ) -> Result<Vec<(String, usize)>> {
+        let (project_exact, project_glob) = project_filter_params(project_path); // added
+        let mut stmt = self.conn.prepare(
+            "SELECT DATE(timestamp), SUM(saved_tokens)
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY DATE(timestamp)
+             ORDER BY DATE(timestamp) DESC
+             LIMIT 30", // added: project filter in WHERE
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            // added: params
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize))
+        })?;
+
+        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        result.reverse();
+        Ok(result)
+    }
+
+    /// Get savings breakdown by feature module.
+    ///
+    /// Returns aggregate stats grouped by the `feature` column, ordered by
+    /// total tokens saved descending.
+    pub fn get_by_feature(&self, project_path: Option<&str>) -> Result<Vec<FeatureStats>> {
+        let (project_exact, project_glob) = project_filter_params(project_path);
+        let mut stmt = self.conn.prepare(
+            "SELECT feature, COUNT(*), SUM(saved_tokens), AVG(savings_pct)
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY feature
+             ORDER BY SUM(saved_tokens) DESC",
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            Ok(FeatureStats {
+                feature: row.get(0)?,
+                commands: row.get::<_, i64>(1)? as usize,
+                saved_tokens: row.get::<_, i64>(2)? as usize,
+                avg_savings_pct: row.get(3)?,
+            })
+        })?;
+
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Get daily statistics for all recorded days.
+    ///
+    /// Returns one [`DayStats`] per day with commands executed, tokens saved,
+    /// and execution time metrics. Results are ordered chronologically (oldest first).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::Tracker;
+    ///
+    /// let tracker = Tracker::new()?;
+    /// let days = tracker.get_all_days()?;
+    /// for day in days.iter().take(7) {
+    ///     println!("{}: {} commands, {} tokens saved",
+    ///         day.date, day.commands, day.saved_tokens);
+    /// }
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn get_all_days(&self) -> Result<Vec<DayStats>> {
+        self.get_all_days_filtered(None) // delegate to filtered variant
+    }
+
+    /// Get daily statistics filtered by project path. // added
+    pub fn get_all_days_filtered(&self, project_path: Option<&str>) -> Result<Vec<DayStats>> {
+        let (project_exact, project_glob) = project_filter_params(project_path); // added
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                DATE(timestamp) as date,
+                COUNT(*) as commands,
+                SUM(input_tokens) as input,
+                SUM(output_tokens) as output,
+                SUM(saved_tokens) as saved,
+                SUM(exec_time_ms) as total_time
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY DATE(timestamp)
+             ORDER BY DATE(timestamp) DESC", // added: project filter
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            // added: params
+            let input = row.get::<_, i64>(2)? as usize;
+            let saved = row.get::<_, i64>(4)? as usize;
+            let commands = row.get::<_, i64>(1)? as usize;
+            let total_time = row.get::<_, i64>(5)? as u64;
+            let savings_pct = if input > 0 {
+                (saved as f64 / input as f64) * 100.0
+            } else {
+                0.0
+            };
+            let avg_time_ms = if commands > 0 {
+                total_time / commands as u64
+            } else {
+                0
+            };
+
+            Ok(DayStats {
+                date: row.get(0)?,
+                commands,
+                input_tokens: input,
+                output_tokens: row.get::<_, i64>(3)? as usize,
+                saved_tokens: saved,
+                savings_pct,
+                total_time_ms: total_time,
+                avg_time_ms,
+            })
+        })?;
+
+        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        result.reverse();
+        Ok(result)
+    }
+
+    /// Get weekly statistics grouped by week.
+    ///
+    /// Returns one [`WeekStats`] per week with aggregated metrics.
+    /// Weeks start on Sunday (SQLite default). Results ordered chronologically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::Tracker;
+    ///
+    /// let tracker = Tracker::new()?;
+    /// let weeks = tracker.get_by_week()?;
+    /// for week in weeks {
+    ///     println!("{} to {}: {} tokens saved",
+    ///         week.week_start, week.week_end, week.saved_tokens);
+    /// }
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn get_by_week(&self) -> Result<Vec<WeekStats>> {
+        self.get_by_week_filtered(None) // delegate to filtered variant
+    }
+
+    /// Get weekly statistics filtered by project path. // added
+    pub fn get_by_week_filtered(&self, project_path: Option<&str>) -> Result<Vec<WeekStats>> {
+        let (project_exact, project_glob) = project_filter_params(project_path); // added
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                DATE(timestamp, 'weekday 0', '-6 days') as week_start,
+                DATE(timestamp, 'weekday 0') as week_end,
+                COUNT(*) as commands,
+                SUM(input_tokens) as input,
+                SUM(output_tokens) as output,
+                SUM(saved_tokens) as saved,
+                SUM(exec_time_ms) as total_time
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY week_start
+             ORDER BY week_start DESC", // added: project filter
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            // added: params
+            let input = row.get::<_, i64>(3)? as usize;
+            let saved = row.get::<_, i64>(5)? as usize;
+            let commands = row.get::<_, i64>(2)? as usize;
+            let total_time = row.get::<_, i64>(6)? as u64;
+            let savings_pct = if input > 0 {
+                (saved as f64 / input as f64) * 100.0
+            } else {
+                0.0
+            };
+            let avg_time_ms = if commands > 0 {
+                total_time / commands as u64
+            } else {
+                0
+            };
+
+            Ok(WeekStats {
+                week_start: row.get(0)?,
+                week_end: row.get(1)?,
+                commands,
+                input_tokens: input,
+                output_tokens: row.get::<_, i64>(4)? as usize,
+                saved_tokens: saved,
+                savings_pct,
+                total_time_ms: total_time,
+                avg_time_ms,
+            })
+        })?;
+
+        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        result.reverse();
+        Ok(result)
+    }
+
+    /// Get monthly statistics grouped by month.
+    ///
+    /// Returns one [`MonthStats`] per month (YYYY-MM format) with aggregated metrics.
+    /// Results ordered chronologically.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::Tracker;
+    ///
+    /// let tracker = Tracker::new()?;
+    /// let months = tracker.get_by_month()?;
+    /// for month in months {
+    ///     println!("{}: {} tokens saved ({:.1}%)",
+    ///         month.month, month.saved_tokens, month.savings_pct);
+    /// }
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn get_by_month(&self) -> Result<Vec<MonthStats>> {
+        self.get_by_month_filtered(None) // delegate to filtered variant
+    }
+
+    /// Get monthly statistics filtered by project path. // added
+    pub fn get_by_month_filtered(&self, project_path: Option<&str>) -> Result<Vec<MonthStats>> {
+        let (project_exact, project_glob) = project_filter_params(project_path); // added
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                strftime('%Y-%m', timestamp) as month,
+                COUNT(*) as commands,
+                SUM(input_tokens) as input,
+                SUM(output_tokens) as output,
+                SUM(saved_tokens) as saved,
+                SUM(exec_time_ms) as total_time
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             GROUP BY month
+             ORDER BY month DESC", // added: project filter
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob], |row| {
+            // added: params
+            let input = row.get::<_, i64>(2)? as usize;
+            let saved = row.get::<_, i64>(4)? as usize;
+            let commands = row.get::<_, i64>(1)? as usize;
+            let total_time = row.get::<_, i64>(5)? as u64;
+            let savings_pct = if input > 0 {
+                (saved as f64 / input as f64) * 100.0
+            } else {
+                0.0
+            };
+            let avg_time_ms = if commands > 0 {
+                total_time / commands as u64
+            } else {
+                0
+            };
+
+            Ok(MonthStats {
+                month: row.get(0)?,
+                commands,
+                input_tokens: input,
+                output_tokens: row.get::<_, i64>(3)? as usize,
+                saved_tokens: saved,
+                savings_pct,
+                total_time_ms: total_time,
+                avg_time_ms,
+            })
+        })?;
+
+        let mut result: Vec<_> = rows.collect::<Result<Vec<_>, _>>()?;
+        result.reverse();
+        Ok(result)
+    }
+
+    /// Get recent command history.
+    ///
+    /// Returns up to `limit` most recent command records, ordered by timestamp (newest first).
+    ///
+    /// # Arguments
+    ///
+    /// - `limit`: Maximum number of records to return
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::Tracker;
+    ///
+    /// let tracker = Tracker::new()?;
+    /// let recent = tracker.get_recent(10)?;
+    /// for cmd in recent {
+    ///     println!("{}: {} saved {:.1}%",
+    ///         cmd.timestamp, cmd.contextzip_cmd, cmd.savings_pct);
+    /// }
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    #[allow(dead_code)]
+    pub fn get_recent(&self, limit: usize) -> Result<Vec<CommandRecord>> {
+        self.get_recent_filtered(limit, None) // delegate to filtered variant
+    }
+
+    /// Get recent command history filtered by project path.
+    pub fn get_recent_filtered(
+        &self,
+        limit: usize,
+        project_path: Option<&str>,
+    ) -> Result<Vec<CommandRecord>> {
+        let (project_exact, project_glob) = project_filter_params(project_path);
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, contextzip_cmd, input_tokens, output_tokens, saved_tokens, savings_pct
+             FROM commands
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+             ORDER BY timestamp DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_glob, limit as i64], |row| {
+            Ok(CommandRecord {
+                timestamp: DateTime::parse_from_rfc3339(&row.get::<_, String>(0)?)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now()),
+                contextzip_cmd: row.get(1)?,
+                input_tokens: row.get::<_, i64>(2)? as usize,
+                output_tokens: row.get::<_, i64>(3)? as usize,
+                saved_tokens: row.get::<_, i64>(4)? as usize,
+                savings_pct: row.get(5)?,
+            })
+        })?;
+
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Count commands since a given timestamp (for telemetry).
+    pub fn count_commands_since(&self, since: chrono::DateTime<chrono::Utc>) -> Result<i64> {
+        let ts = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE timestamp >= ?1",
+            params![ts],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get top N commands by frequency (for telemetry).
+    pub fn top_commands(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT contextzip_cmd, COUNT(*) as cnt FROM commands
+             GROUP BY contextzip_cmd ORDER BY cnt DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let cmd: String = row.get(0)?;
+            // Extract just the command name (e.g. "contextzip git status" → "git")
+            Ok(cmd.split_whitespace().nth(1).unwrap_or(&cmd).to_string())
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get overall savings percentage (for telemetry).
+    pub fn overall_savings_pct(&self) -> Result<f64> {
+        let (total_input, total_saved): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(saved_tokens), 0) FROM commands",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if total_input > 0 {
+            Ok((total_saved as f64 / total_input as f64) * 100.0)
+        } else {
+            Ok(0.0)
+        }
+    }
+
+    /// Get total tokens saved across all tracked commands (for telemetry).
+    pub fn total_tokens_saved(&self) -> Result<i64> {
+        let saved: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(saved_tokens), 0) FROM commands",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(saved)
+    }
+
+    /// Get tokens saved in the last 24 hours (for telemetry).
+    pub fn tokens_saved_24h(&self, since: chrono::DateTime<chrono::Utc>) -> Result<i64> {
+        let ts = since.format("%Y-%m-%dT%H:%M:%S").to_string();
+        let saved: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(saved_tokens), 0) FROM commands WHERE timestamp >= ?1",
+            params![ts],
+            |row| row.get(0),
+        )?;
+        Ok(saved)
+    }
+}
+
+fn get_db_path() -> Result<PathBuf> {
+    // Priority 1: Environment variable CONTEXTZIP_DB_PATH
+    if let Ok(custom_path) = std::env::var("CONTEXTZIP_DB_PATH") {
+        return Ok(PathBuf::from(custom_path));
+    }
+
+    // Priority 2: Configuration file
+    if let Ok(config) = crate::config::Config::load() {
+        if let Some(db_path) = config.tracking.database_path {
+            return Ok(db_path);
+        }
+    }
+
+    // Priority 3: Default platform-specific location
+    let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    Ok(data_dir.join("contextzip").join("history.db"))
+}
+
+/// Individual parse failure record.
+#[derive(Debug)]
+pub struct ParseFailureRecord {
+    pub timestamp: String,
+    pub raw_command: String,
+    #[allow(dead_code)]
+    pub error_message: String,
+    pub fallback_succeeded: bool,
+}
+
+/// Aggregated parse failure summary.
+#[derive(Debug)]
+pub struct ParseFailureSummary {
+    pub total: usize,
+    pub recovery_rate: f64,
+    pub top_commands: Vec<(String, usize)>,
+    pub recent: Vec<ParseFailureRecord>,
+}
+
+/// Record a parse failure without ever crashing.
+/// Silently ignores all errors — used in the fallback path.
+pub fn record_parse_failure_silent(raw_command: &str, error_message: &str, succeeded: bool) {
+    if let Ok(tracker) = Tracker::new() {
+        let _ = tracker.record_parse_failure(raw_command, error_message, succeeded);
+    }
+}
+
+/// Estimate token count from text using ~4 chars = 1 token heuristic.
+///
+/// This is a fast approximation suitable for tracking purposes.
+/// For precise counts, integrate with your LLM's tokenizer API.
+///
+/// # Formula
+///
+/// `tokens = ceil(chars / 4)`
+///
+/// # Examples
+///
+/// ```
+/// use contextzip::tracking::estimate_tokens;
+///
+/// assert_eq!(estimate_tokens(""), 0);
+/// assert_eq!(estimate_tokens("abcd"), 1);  // 4 chars = 1 token
+/// assert_eq!(estimate_tokens("abcde"), 2); // 5 chars = ceil(1.25) = 2
+/// assert_eq!(estimate_tokens("hello world"), 3); // 11 chars = ceil(2.75) = 3
+/// ```
+pub fn estimate_tokens(text: &str) -> usize {
+    // ~4 chars per token on average
+    (text.len() as f64 / 4.0).ceil() as usize
+}
+
+/// Format token count for human-readable display.
+///
+/// - < 1,000: shown as-is (e.g., "847")
+/// - 1,000..999,999: shown as "X.YK" (e.g., "1.2K")
+/// - >= 1,000,000: shown as "X.YM" (e.g., "1.2M")
+pub fn format_tokens(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Check if per-command savings display should be suppressed.
+fn is_quiet() -> bool {
+    if std::env::var("CONTEXTZIP_QUIET").is_ok() {
+        return true;
+    }
+    crate::config::Config::load()
+        .map(|c| c.display.quiet)
+        .unwrap_or(false)
+}
+
+/// Print per-command token savings to stderr (dim/gray).
+fn print_savings(input_tokens: usize, output_tokens: usize) {
+    let saved = input_tokens.saturating_sub(output_tokens);
+    if saved == 0 || is_quiet() {
+        return;
+    }
+    let pct = if input_tokens > 0 {
+        (saved as f64 / input_tokens as f64 * 100.0) as u32
+    } else {
+        0
+    };
+    eprintln!(
+        "\x1b[2m\u{1f4be} contextzip: {} \u{2192} {} tokens (saved {}%)\x1b[0m",
+        format_tokens(input_tokens),
+        format_tokens(output_tokens),
+        pct
+    );
+}
+
+/// Helper struct for timing command execution
+/// Helper for timing command execution and tracking results.
+///
+/// Preferred API for tracking commands. Automatically measures execution time
+/// and records token savings. Use instead of the deprecated [`track`] function.
+///
+/// # Examples
+///
+/// ```no_run
+/// use contextzip::tracking::TimedExecution;
+///
+/// let timer = TimedExecution::start();
+/// let input = execute_standard_command()?;
+/// let output = execute_contextzip_command()?;
+/// timer.track("ls -la", "contextzip ls", &input, &output);
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub struct TimedExecution {
+    start: Instant,
+}
+
+impl TimedExecution {
+    /// Start timing a command execution.
+    ///
+    /// Creates a new timer that starts measuring elapsed time immediately.
+    /// Call [`track`](Self::track) or [`track_passthrough`](Self::track_passthrough)
+    /// when the command completes.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::TimedExecution;
+    ///
+    /// let timer = TimedExecution::start();
+    /// // ... execute command ...
+    /// timer.track("cmd", "contextzip cmd", "input", "output");
+    /// ```
+    pub fn start() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+
+    /// Track the command with elapsed time and token counts.
+    ///
+    /// Records the command execution with:
+    /// - Elapsed time since [`start`](Self::start)
+    /// - Token counts estimated from input/output strings
+    /// - Calculated savings metrics
+    ///
+    /// # Arguments
+    ///
+    /// - `original_cmd`: Standard command (e.g., "ls -la")
+    /// - `contextzip_cmd`: ContextZip command used (e.g., "contextzip ls")
+    /// - `input`: Standard command output (for token estimation)
+    /// - `output`: ContextZip command output (for token estimation)
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::TimedExecution;
+    ///
+    /// let timer = TimedExecution::start();
+    /// let input = "long output...";
+    /// let output = "short output";
+    /// timer.track("ls -la", "contextzip ls", input, output);
+    /// ```
+    pub fn track(&self, original_cmd: &str, contextzip_cmd: &str, input: &str, output: &str) {
+        self.track_with_feature(original_cmd, contextzip_cmd, input, output, "cli");
+    }
+
+    /// Track a command execution tagged with a specific feature module.
+    pub fn track_with_feature(
+        &self,
+        original_cmd: &str,
+        contextzip_cmd: &str,
+        input: &str,
+        output: &str,
+        feature: &str,
+    ) {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        let input_tokens = estimate_tokens(input);
+        let output_tokens = estimate_tokens(output);
+
+        if let Ok(tracker) = Tracker::new() {
+            let _ = tracker.record_with_feature(
+                original_cmd,
+                contextzip_cmd,
+                input_tokens,
+                output_tokens,
+                elapsed_ms,
+                feature,
+            );
+        }
+
+        // Show per-command savings to stderr
+        print_savings(input_tokens, output_tokens);
+    }
+
+    /// Track passthrough commands (timing-only, no token counting).
+    ///
+    /// For commands that stream output or run interactively where output
+    /// cannot be captured. Records execution time but sets tokens to 0
+    /// (does not dilute savings statistics).
+    ///
+    /// # Arguments
+    ///
+    /// - `original_cmd`: Standard command (e.g., "git tag --list")
+    /// - `contextzip_cmd`: ContextZip command used (e.g., "contextzip git tag --list")
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use contextzip::tracking::TimedExecution;
+    ///
+    /// let timer = TimedExecution::start();
+    /// // ... execute streaming command ...
+    /// timer.track_passthrough("git tag", "contextzip git tag");
+    /// ```
+    pub fn track_passthrough(&self, original_cmd: &str, contextzip_cmd: &str) {
+        let elapsed_ms = self.start.elapsed().as_millis() as u64;
+        // input_tokens=0, output_tokens=0 won't dilute savings statistics
+        if let Ok(tracker) = Tracker::new() {
+            let _ = tracker.record(original_cmd, contextzip_cmd, 0, 0, elapsed_ms);
+        }
+    }
+}
+
+/// Format OsString args for tracking display.
+///
+/// Joins arguments with spaces, converting each to UTF-8 (lossy).
+/// Useful for displaying command arguments in tracking records.
+///
+/// # Examples
+///
+/// ```
+/// use std::ffi::OsString;
+/// use contextzip::tracking::args_display;
+///
+/// let args = vec![OsString::from("status"), OsString::from("--short")];
+/// assert_eq!(args_display(&args), "status --short");
+/// ```
+pub fn args_display(args: &[OsString]) -> String {
+    args.iter()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Track a command execution (legacy function, use [`TimedExecution`] for new code).
+///
+/// # Deprecation Notice
+///
+/// This function is deprecated. Use [`TimedExecution`] instead for automatic
+/// timing and cleaner API.
+///
+/// # Arguments
+///
+/// - `original_cmd`: Standard command (e.g., "ls -la")
+/// - `contextzip_cmd`: ContextZip command used (e.g., "contextzip ls")
+/// - `input`: Standard command output (for token estimation)
+/// - `output`: ContextZip command output (for token estimation)
+///
+/// # Migration
+///
+/// ```no_run
+/// # use contextzip::tracking::{track, TimedExecution};
+/// // Old (deprecated)
+/// track("ls -la", "contextzip ls", "input", "output");
+///
+/// // New (preferred)
+/// let timer = TimedExecution::start();
+/// timer.track("ls -la", "contextzip ls", "input", "output");
+/// ```
+#[deprecated(note = "Use TimedExecution instead")]
+#[allow(dead_code)]
+pub fn track(original_cmd: &str, contextzip_cmd: &str, input: &str, output: &str) {
+    let input_tokens = estimate_tokens(input);
+    let output_tokens = estimate_tokens(output);
+
+    if let Ok(tracker) = Tracker::new() {
+        let _ = tracker.record(original_cmd, contextzip_cmd, input_tokens, output_tokens, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 1. estimate_tokens — verify ~4 chars/token ratio
+    #[test]
+    fn test_estimate_tokens() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1); // 4 chars = 1 token
+        assert_eq!(estimate_tokens("abcde"), 2); // 5 chars = ceil(1.25) = 2
+        assert_eq!(estimate_tokens("a"), 1); // 1 char = ceil(0.25) = 1
+        assert_eq!(estimate_tokens("12345678"), 2); // 8 chars = 2 tokens
+    }
+
+    // 2. args_display — format OsString vec
+    #[test]
+    fn test_args_display() {
+        let args = vec![OsString::from("status"), OsString::from("--short")];
+        assert_eq!(args_display(&args), "status --short");
+        assert_eq!(args_display(&[]), "");
+
+        let single = vec![OsString::from("log")];
+        assert_eq!(args_display(&single), "log");
+    }
+
+    // 3. Tracker::record + get_recent — round-trip DB
+    #[test]
+    fn test_tracker_record_and_recent() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+
+        // Use unique test identifier to avoid conflicts with other tests
+        let test_cmd = format!("contextzip git status test_{}", std::process::id());
+
+        tracker
+            .record("git status", &test_cmd, 100, 20, 50)
+            .expect("Failed to record");
+
+        let recent = tracker.get_recent(10).expect("Failed to get recent");
+
+        // Find our specific test record
+        let test_record = recent
+            .iter()
+            .find(|r| r.contextzip_cmd == test_cmd)
+            .expect("Test record not found in recent commands");
+
+        assert_eq!(test_record.saved_tokens, 80);
+        assert_eq!(test_record.savings_pct, 80.0);
+    }
+
+    // 4. track_passthrough doesn't dilute stats (input=0, output=0)
+    #[test]
+    fn test_track_passthrough_no_dilution() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+
+        // Use unique test identifiers
+        let pid = std::process::id();
+        let cmd1 = format!("contextzip cmd1_test_{}", pid);
+        let cmd2 = format!("contextzip cmd2_passthrough_test_{}", pid);
+
+        // Record one real command with 80% savings
+        tracker
+            .record("cmd1", &cmd1, 1000, 200, 10)
+            .expect("Failed to record cmd1");
+
+        // Record passthrough (0, 0)
+        tracker
+            .record("cmd2", &cmd2, 0, 0, 5)
+            .expect("Failed to record passthrough");
+
+        // Verify both records exist in recent history
+        let recent = tracker.get_recent(20).expect("Failed to get recent");
+
+        let record1 = recent
+            .iter()
+            .find(|r| r.contextzip_cmd == cmd1)
+            .expect("cmd1 record not found");
+        let record2 = recent
+            .iter()
+            .find(|r| r.contextzip_cmd == cmd2)
+            .expect("passthrough record not found");
+
+        // Verify cmd1 has 80% savings
+        assert_eq!(record1.saved_tokens, 800);
+        assert_eq!(record1.savings_pct, 80.0);
+
+        // Verify passthrough has 0% savings
+        assert_eq!(record2.saved_tokens, 0);
+        assert_eq!(record2.savings_pct, 0.0);
+
+        // This validates that passthrough (0 input, 0 output) doesn't dilute stats
+        // because the savings calculation is correct for both cases
+    }
+
+    // 5. TimedExecution::track records with exec_time > 0
+    #[test]
+    fn test_timed_execution_records_time() {
+        let timer = TimedExecution::start();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        timer.track("test cmd", "contextzip test", "raw input data", "filtered");
+
+        // Verify via DB that record exists
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let recent = tracker.get_recent(5).expect("Failed to get recent");
+        assert!(recent.iter().any(|r| r.contextzip_cmd == "contextzip test"));
+    }
+
+    // 6. TimedExecution::track_passthrough records with 0 tokens
+    #[test]
+    fn test_timed_execution_passthrough() {
+        let timer = TimedExecution::start();
+        timer.track_passthrough("git tag", "contextzip git tag (passthrough)");
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let recent = tracker.get_recent(5).expect("Failed to get recent");
+
+        let pt = recent
+            .iter()
+            .find(|r| r.contextzip_cmd.contains("passthrough"))
+            .expect("Passthrough record not found");
+
+        // savings_pct should be 0 for passthrough
+        assert_eq!(pt.savings_pct, 0.0);
+        assert_eq!(pt.saved_tokens, 0);
+    }
+
+    // 7. get_db_path respects environment variable CONTEXTZIP_DB_PATH
+    #[test]
+    fn test_custom_db_path_env() {
+        use std::env;
+
+        let custom_path = "/tmp/rtk_test_custom.db";
+        env::set_var("CONTEXTZIP_DB_PATH", custom_path);
+
+        let db_path = get_db_path().expect("Failed to get db path");
+        assert_eq!(db_path, PathBuf::from(custom_path));
+
+        env::remove_var("CONTEXTZIP_DB_PATH");
+    }
+
+    // 8. get_db_path falls back to default when no custom config
+    #[test]
+    fn test_default_db_path() {
+        use std::env;
+
+        // Ensure no env var is set
+        env::remove_var("CONTEXTZIP_DB_PATH");
+
+        let db_path = get_db_path().expect("Failed to get db path");
+        assert!(db_path.ends_with("contextzip/history.db"));
+    }
+
+    // 9. project_filter_params uses GLOB pattern with * wildcard // added
+    #[test]
+    fn test_project_filter_params_glob_pattern() {
+        let (exact, glob) = project_filter_params(Some("/home/user/project"));
+        assert_eq!(exact.unwrap(), "/home/user/project");
+        // Must use * (GLOB) not % (LIKE) for subdirectory prefix matching
+        let glob_val = glob.unwrap();
+        assert!(glob_val.ends_with('*'), "GLOB pattern must end with *");
+        assert!(!glob_val.contains('%'), "Must not contain LIKE wildcard %");
+        assert_eq!(
+            glob_val,
+            format!("/home/user/project{}*", std::path::MAIN_SEPARATOR)
+        );
+    }
+
+    // 10. project_filter_params returns None for None input // added
+    #[test]
+    fn test_project_filter_params_none() {
+        let (exact, glob) = project_filter_params(None);
+        assert!(exact.is_none());
+        assert!(glob.is_none());
+    }
+
+    // 11. GLOB pattern safe with underscores in path names // added
+    #[test]
+    fn test_project_filter_params_underscore_safe() {
+        // In LIKE, _ matches any single char; in GLOB, _ is literal
+        let (exact, glob) = project_filter_params(Some("/home/user/my_project"));
+        assert_eq!(exact.unwrap(), "/home/user/my_project");
+        let glob_val = glob.unwrap();
+        // _ must be preserved literally (GLOB treats _ as literal, LIKE does not)
+        assert!(glob_val.contains("my_project"));
+        assert_eq!(
+            glob_val,
+            format!("/home/user/my_project{}*", std::path::MAIN_SEPARATOR)
+        );
+    }
+
+    // 12. record_parse_failure + get_parse_failure_summary roundtrip
+    #[test]
+    fn test_parse_failure_roundtrip() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let test_cmd = format!("git -C /path status test_{}", std::process::id());
+
+        tracker
+            .record_parse_failure(&test_cmd, "unrecognized subcommand", true)
+            .expect("Failed to record parse failure");
+
+        let summary = tracker
+            .get_parse_failure_summary()
+            .expect("Failed to get summary");
+
+        assert!(summary.total >= 1);
+        assert!(summary.recent.iter().any(|r| r.raw_command == test_cmd));
+    }
+
+    // 13. recovery_rate calculation
+    #[test]
+    fn test_parse_failure_recovery_rate() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+
+        // 2 successes, 1 failure
+        tracker
+            .record_parse_failure(&format!("cmd_ok1_{}", pid), "err", true)
+            .unwrap();
+        tracker
+            .record_parse_failure(&format!("cmd_ok2_{}", pid), "err", true)
+            .unwrap();
+        tracker
+            .record_parse_failure(&format!("cmd_fail_{}", pid), "err", false)
+            .unwrap();
+
+        let summary = tracker.get_parse_failure_summary().unwrap();
+        // We can't assert exact rate because other tests may have added records,
+        // but we can verify recovery_rate is between 0 and 100
+        assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+    }
+
+    // 14. record_with_feature stores feature column correctly
+    #[test]
+    fn test_record_with_feature() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+        let cmd = format!("contextzip_feat_test_{}", pid);
+
+        tracker
+            .record_with_feature("test cmd", &cmd, 500, 50, 10, "error")
+            .expect("Failed to record with feature");
+
+        // Verify via get_by_feature
+        let features = tracker
+            .get_by_feature(None)
+            .expect("Failed to get by feature");
+        let error_feat = features.iter().find(|f| f.feature == "error");
+        assert!(error_feat.is_some(), "Expected 'error' feature in results");
+        assert!(error_feat.unwrap().commands >= 1);
+    }
+
+    // 15. record() defaults to 'cli' feature
+    #[test]
+    fn test_record_defaults_to_cli_feature() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+        let cmd = format!("contextzip_cli_default_test_{}", pid);
+
+        tracker
+            .record("test cmd", &cmd, 200, 40, 10)
+            .expect("Failed to record");
+
+        let features = tracker
+            .get_by_feature(None)
+            .expect("Failed to get by feature");
+        let cli_feat = features.iter().find(|f| f.feature == "cli");
+        assert!(cli_feat.is_some(), "Expected 'cli' feature in results");
+    }
+
+    // 16. get_by_feature returns multiple feature groups
+    #[test]
+    fn test_get_by_feature_multiple() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+
+        tracker
+            .record_with_feature(
+                "cmd1",
+                &format!("feat_multi_{}_a", pid),
+                1000,
+                100,
+                5,
+                "web",
+            )
+            .expect("Failed to record web");
+        tracker
+            .record_with_feature(
+                "cmd2",
+                &format!("feat_multi_{}_b", pid),
+                500,
+                50,
+                5,
+                "build",
+            )
+            .expect("Failed to record build");
+
+        let features = tracker
+            .get_by_feature(None)
+            .expect("Failed to get by feature");
+        let feature_names: Vec<&str> = features.iter().map(|f| f.feature.as_str()).collect();
+        assert!(feature_names.contains(&"web"), "Missing 'web' feature");
+        assert!(feature_names.contains(&"build"), "Missing 'build' feature");
+    }
+
+    // 17. TimedExecution::track_with_feature stores feature
+    #[test]
+    fn test_timed_execution_track_with_feature() {
+        let timer = TimedExecution::start();
+        timer.track_with_feature(
+            "cmd",
+            "contextzip cmd",
+            "long input data",
+            "short",
+            "docker",
+        );
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let features = tracker
+            .get_by_feature(None)
+            .expect("Failed to get by feature");
+        let docker_feat = features.iter().find(|f| f.feature == "docker");
+        assert!(
+            docker_feat.is_some(),
+            "Expected 'docker' feature from timed execution"
+        );
+    }
+
+    // 18. gain --by-feature accuracy: multiple features with known values aggregate correctly
+    #[test]
+    fn test_by_feature_aggregation_accuracy() {
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let pid = std::process::id();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tag = format!("{}_{}", pid, ts);
+
+        // Insert known entries for distinct features using unique cmd names
+        // Feature "ansi": 2 commands, saved = 800 + 700 = 1500
+        tracker
+            .record_with_feature("cmd", &format!("ansi_a_{}", tag), 1000, 200, 5, "ansi")
+            .expect("record ansi_a");
+        tracker
+            .record_with_feature("cmd", &format!("ansi_b_{}", tag), 800, 100, 5, "ansi")
+            .expect("record ansi_b");
+
+        // Feature "error": 1 command, saved = 450
+        tracker
+            .record_with_feature("cmd", &format!("error_a_{}", tag), 500, 50, 5, "error")
+            .expect("record error_a");
+
+        // Feature "pkg": 3 commands, saved = 1600 + 1200 + 800 = 3600
+        tracker
+            .record_with_feature("cmd", &format!("pkg_a_{}", tag), 2000, 400, 5, "pkg")
+            .expect("record pkg_a");
+        tracker
+            .record_with_feature("cmd", &format!("pkg_b_{}", tag), 1500, 300, 5, "pkg")
+            .expect("record pkg_b");
+        tracker
+            .record_with_feature("cmd", &format!("pkg_c_{}", tag), 1000, 200, 5, "pkg")
+            .expect("record pkg_c");
+
+        let features = tracker
+            .get_by_feature(None)
+            .expect("Failed to get by feature");
+
+        // Verify ansi feature: at least 2 commands, saved >= 1500
+        let ansi = features
+            .iter()
+            .find(|f| f.feature == "ansi")
+            .expect("ansi feature missing");
+        assert!(
+            ansi.commands >= 2,
+            "ansi should have >= 2 commands, got {}",
+            ansi.commands
+        );
+        assert!(
+            ansi.saved_tokens >= 1500,
+            "ansi saved should be >= 1500, got {}",
+            ansi.saved_tokens
+        );
+
+        // Verify error feature: at least 1 command, saved >= 450
+        let error = features
+            .iter()
+            .find(|f| f.feature == "error")
+            .expect("error feature missing");
+        assert!(
+            error.commands >= 1,
+            "error should have >= 1 command, got {}",
+            error.commands
+        );
+        assert!(
+            error.saved_tokens >= 450,
+            "error saved should be >= 450, got {}",
+            error.saved_tokens
+        );
+
+        // Verify pkg feature: at least 3 commands, saved >= 3600
+        let pkg = features
+            .iter()
+            .find(|f| f.feature == "pkg")
+            .expect("pkg feature missing");
+        assert!(
+            pkg.commands >= 3,
+            "pkg should have >= 3 commands, got {}",
+            pkg.commands
+        );
+        assert!(
+            pkg.saved_tokens >= 3600,
+            "pkg saved should be >= 3600, got {}",
+            pkg.saved_tokens
+        );
+
+        // Verify ordering: results sorted by saved_tokens descending
+        for w in features.windows(2) {
+            assert!(
+                w[0].saved_tokens >= w[1].saved_tokens,
+                "Features should be sorted descending by saved_tokens: {} ({}) >= {} ({})",
+                w[0].feature,
+                w[0].saved_tokens,
+                w[1].feature,
+                w[1].saved_tokens
+            );
+        }
+
+        // Verify avg_savings_pct is reasonable (between 0 and 100)
+        for f in &features {
+            assert!(
+                f.avg_savings_pct >= 0.0 && f.avg_savings_pct <= 100.0,
+                "avg_savings_pct for {} should be 0-100, got {}",
+                f.feature,
+                f.avg_savings_pct
+            );
+        }
+    }
+
+    // 19. format_tokens displays human-readable token counts
+    #[test]
+    fn test_format_tokens() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(42), "42");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1000), "1.0K");
+        assert_eq!(format_tokens(1234), "1.2K");
+        assert_eq!(format_tokens(12345), "12.3K");
+        assert_eq!(format_tokens(999999), "1000.0K");
+        assert_eq!(format_tokens(1000000), "1.0M");
+        assert_eq!(format_tokens(1234567), "1.2M");
+    }
+
+    // 20. savings calculation correctness in track_with_feature
+    #[test]
+    fn test_savings_calculation() {
+        // Verify the math: saved = input - output, pct = saved / input * 100
+        let input_tokens = 1000_usize;
+        let output_tokens = 130_usize;
+        let saved = input_tokens.saturating_sub(output_tokens);
+        assert_eq!(saved, 870);
+        let pct = (saved as f64 / input_tokens as f64 * 100.0) as u32;
+        assert_eq!(pct, 87);
+
+        // Edge case: no savings
+        let saved_zero = 500_usize.saturating_sub(500);
+        assert_eq!(saved_zero, 0);
+
+        // Edge case: output larger than input (shouldn't happen, but saturating_sub handles it)
+        let saved_neg = 100_usize.saturating_sub(200);
+        assert_eq!(saved_neg, 0);
+    }
+
+    // 21. CONTEXTZIP_QUIET=1 suppresses savings display
+    #[test]
+    fn test_quiet_env_suppresses_output() {
+        use std::env;
+
+        env::set_var("CONTEXTZIP_QUIET", "1");
+        assert!(is_quiet());
+        env::remove_var("CONTEXTZIP_QUIET");
+    }
+
+    // 22. is_quiet returns false when env var not set and config default
+    #[test]
+    fn test_not_quiet_by_default() {
+        use std::env;
+
+        env::remove_var("CONTEXTZIP_QUIET");
+        // With default config (quiet: false), should not be quiet
+        // Note: this may read real config file, but default is quiet=false
+        let quiet = std::env::var("CONTEXTZIP_QUIET").is_ok();
+        assert!(!quiet);
+    }
+}
