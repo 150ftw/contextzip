@@ -9,13 +9,13 @@
   <code>cargo install --git https://github.com/150ftw/contextzip</code>
 </h3>
 
-<p align="center"><sub><b>For:</b> Claude Code / Cursor / Copilot CLI users hitting token limits.<br>
+<p align="center"><sub><b>For:</b> anyone whose AI coding agent runs terminal commands: Claude Code, Cursor, VS Code Copilot, Gemini CLI, Antigravity, OpenCode. Any model: Claude, Gemini, GPT, GPT-OSS, open-weight.<br>
 <b>Not for:</b> projects where you need raw command output (use <code>contextzip proxy &lt;cmd&gt;</code> instead).</sub></p>
 
 <p align="center">
   <a href="https://github.com/150ftw/contextzip/releases"><img src="https://img.shields.io/github/v/release/150ftw/contextzip?style=flat-square&color=blue" alt="Release" /></a>
   <a href="https://github.com/150ftw/contextzip/actions"><img src="https://img.shields.io/github/actions/workflow/status/150ftw/contextzip/ci.yml?style=flat-square" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/tests-1%2C120_passing-brightgreen?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-1%2C132_passing-brightgreen?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/benchmarks-102_cases-orange?style=flat-square" alt="Benchmarks" />
   <a href="LICENSE"><img src="https://img.shields.io/github/license/150ftw/contextzip?style=flat-square" alt="License" /></a>
 </p>
@@ -27,11 +27,32 @@
 ```bash
 # macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/150ftw/contextzip/main/install.sh | bash
-contextzip init -g
+
+contextzip init -g                  # Claude Code
+contextzip init --agent all         # Cursor, VS Code Copilot, Gemini CLI, Antigravity
 ```
 
-Restart Claude Code. Every command is now compressed. Zero config.
+Restart your agent app. Every command is now compressed. Zero config.
 **macOS · Linux · Windows**
+
+### Works with any agent, any model
+
+ContextZip shrinks command output, so it helps whichever model reads it: Claude, Gemini, GPT, GPT-OSS or a local model. What differs is how each app lets it hook in:
+
+| App | Install | How it works |
+|:---|:---|:---|
+| Claude Code | `contextzip init -g` | Hook rewrites commands automatically |
+| Cursor | `contextzip init --agent cursor` | `preToolUse` hook in `~/.cursor/hooks.json` rewrites commands automatically |
+| VS Code (Copilot agent mode) | `contextzip init --agent copilot` | `PreToolUse` hook in `~/.copilot/hooks/` rewrites commands automatically |
+| Gemini CLI | `contextzip init --agent gemini` | `BeforeTool` hook in `~/.gemini/settings.json` rewrites commands automatically |
+| Antigravity | `contextzip init --agent antigravity` | Always-on rule asks the agent to prefix commands (Antigravity hooks can't rewrite commands) |
+| OpenCode | `contextzip init -g --opencode` | Plugin rewrites commands automatically |
+| Anything else | — | Tell the agent to prefix commands with `contextzip`, e.g. in `AGENTS.md` |
+
+Remove with the same command plus `--uninstall`, e.g. `contextzip init --agent all --uninstall`.
+
+> [!NOTE]
+> In Cursor and VS Code, a command ContextZip rewrites is auto-approved, as it is in Claude Code (the only rewrite response those apps accept). Only known commands are rewritten (`git`, `cargo`, `ls`, test runners…); anything else, like `rm`, goes through the app's normal approval.
 
 > [!TIP]
 > Need raw output? Use `contextzip proxy <command>` to bypass all filters.

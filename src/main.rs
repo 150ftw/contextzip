@@ -1,3 +1,4 @@
+mod agent_hook;
 mod ansi_filter;
 mod aws_cmd;
 mod binlog;
@@ -365,6 +366,18 @@ enum Commands {
         /// Remove all RTK artifacts (hook, RTK.md, CLAUDE.md reference, settings.json entry)
         #[arg(long)]
         uninstall: bool,
+
+        /// Install for other agent apps instead of Claude Code (repeatable).
+        /// With --uninstall, removes them. Example: --agent cursor --agent gemini
+        #[arg(long, value_enum)]
+        agent: Vec<agent_hook::Agent>,
+    },
+
+    /// Hook entry point for agent apps (reads the app's JSON on stdin).
+    /// Installed by `contextzip init --agent <app>`; not meant to be run by hand.
+    Hook {
+        #[arg(value_enum)]
+        format: agent_hook::HookFormat,
     },
 
     /// Download with compact output (strips progress bars)
@@ -1076,6 +1089,7 @@ enum GoCommands {
 /// If Clap fails to parse these, show the Clap error directly.
 const RTK_META_COMMANDS: &[&str] = &[
     "gain",
+    "hook",
     "discover",
     "learn",
     "init",
@@ -1690,8 +1704,11 @@ fn main() -> Result<()> {
             auto_patch,
             no_patch,
             uninstall,
+            agent,
         } => {
-            if show {
+            if !agent.is_empty() {
+                agent_hook::run_init(&agent, uninstall)?;
+            } else if show {
                 init::show_config()?;
             } else if uninstall {
                 init::uninstall(global, cli.verbose)?;
@@ -1716,6 +1733,10 @@ fn main() -> Result<()> {
                     cli.verbose,
                 )?;
             }
+        }
+
+        Commands::Hook { format } => {
+            agent_hook::run(format)?;
         }
 
         Commands::Uninstall { purge } => {

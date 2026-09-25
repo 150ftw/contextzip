@@ -45,6 +45,7 @@ contextzip binary
 | tracking.rs | SQLite tracking with feature column |
 | gain.rs | Analytics dashboard (--by-feature, --graph, --history) |
 | init.rs | Hook installation, uninstall, update |
+| agent_hook.rs | Non-Claude agents: `hook <cursor\|gemini\|copilot>` entry point + `init --agent` installers |
 | main.rs | CLI router (Clap 4) |
 
 ## Conventions
