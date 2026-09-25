@@ -15,7 +15,7 @@
 <p align="center">
   <a href="https://github.com/150ftw/contextzip/releases"><img src="https://img.shields.io/github/v/release/150ftw/contextzip?style=flat-square&color=blue" alt="Release" /></a>
   <a href="https://github.com/150ftw/contextzip/actions"><img src="https://img.shields.io/github/actions/workflow/status/150ftw/contextzip/ci.yml?style=flat-square" alt="CI" /></a>
-  <img src="https://img.shields.io/badge/tests-1%2C132_passing-brightgreen?style=flat-square" alt="Tests" />
+  <img src="https://img.shields.io/badge/tests-1%2C136_passing-brightgreen?style=flat-square" alt="Tests" />
   <img src="https://img.shields.io/badge/benchmarks-102_cases-orange?style=flat-square" alt="Benchmarks" />
   <a href="LICENSE"><img src="https://img.shields.io/github/license/150ftw/contextzip?style=flat-square" alt="License" /></a>
 </p>
@@ -324,6 +324,7 @@ Short version in [`ROADMAP.md`](ROADMAP.md).
 | | |
 |:---|:---|
 | 🔴 Error messages | **ALWAYS** preserved |
+| ✏️ Changed lines in `git diff` / `git show` | **NEVER** dropped (only unchanged context and lock-file bodies are trimmed) |
 | 📍 File:line in build errors | **NEVER** removed |
 | 🔒 Security warnings (CVE, GHSA) | **ALWAYS** kept |
 | 🐳 Docker failure context | **ALWAYS** preserved |

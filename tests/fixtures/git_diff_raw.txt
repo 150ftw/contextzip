@@ -1,0 +1,82 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+index a70b10a..272db06 100644
+--- a/.github/workflows/release.yml
++++ b/.github/workflows/release.yml
+@@ -23,6 +23,7 @@ jobs:
+             target: x86_64-unknown-linux-gnu
+             os: ubuntu-latest
+             cross: true
++            update_name: linux-x86_64
+           - name: linux-x86_64-musl
+             target: x86_64-unknown-linux-musl
+             os: ubuntu-latest
+@@ -31,10 +32,12 @@ jobs:
+             target: aarch64-apple-darwin
+             os: macos-latest
+             cross: false
++            update_name: darwin-aarch64
+           - name: macos-x86_64
+             target: x86_64-apple-darwin
+             os: macos-latest
+             cross: false
++            update_name: darwin-x86_64
+           - name: windows-x86_64
+             target: x86_64-pc-windows-msvc
+             os: windows-latest
+@@ -71,11 +74,20 @@ jobs:
+         run: |
+           cp target/${{ matrix.target }}/release/contextzip.exe contextzip-${{ matrix.name }}.exe
+ 
++      # `contextzip update` (src/init.rs) expects contextzip-<os>-<arch>.tar.gz
++      # containing a binary named `contextzip`.
++      - name: Package update tarball
++        if: matrix.update_name
++        run: |
++          tar -czf contextzip-${{ matrix.update_name }}.tar.gz -C target/${{ matrix.target }}/release contextzip
++
+       - name: Upload artifact
+         uses: actions/upload-artifact@v4
+         with:
+           name: contextzip-${{ matrix.name }}
+-          path: contextzip-${{ matrix.name }}*
++          path: |
++            contextzip-${{ matrix.name }}*
++            contextzip-*.tar.gz
+ 
+   checksums:
+     name: Generate checksums
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 684824c..af7f59a 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -12,3 +12,5 @@ First release under this repository.
+ ### Bug Fixes
+ 
+ * **wget:** rename test to snake_case so `cargo clippy -- -D warnings` passes
++* **update:** replace the binary via rename instead of writing into the running executable (fixed "Text file busy" on Linux)
++* **release:** publish `contextzip-<os>-<arch>.tar.gz` assets that `contextzip update` downloads
+diff --git a/src/init.rs b/src/init.rs
+index 4391448..c5eced2 100644
+--- a/src/init.rs
++++ b/src/init.rs
+@@ -1646,8 +1646,18 @@ pub fn run_update(verbose: u8) -> Result<()> {
+             .context("Failed to set binary permissions")?;
+     }
+ 
+-    // Replace current binary
+-    fs::copy(&temp_bin, &current_exe).with_context(|| {
++    // Replace current binary: stage next to it, then rename over it. Writing into
++    // the running executable fails on Linux (ETXTBSY) and can invalidate the code
++    // signature on macOS; a same-directory rename swaps the inode atomically.
++    let staged = current_exe.with_extension("new");
++    fs::copy(&temp_bin, &staged).with_context(|| {
++        format!(
++            "Failed to write {}. Try running with sudo.",
++            staged.display()
++        )
++    })?;
++    fs::rename(&staged, &current_exe).with_context(|| {
++        let _ = fs::remove_file(&staged);
+         format!(
+             "Failed to replace binary at {}. Try running with sudo.",
+             current_exe.display()

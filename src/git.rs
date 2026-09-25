@@ -58,7 +58,7 @@ pub fn run(
 
 fn run_diff(
     args: &[String],
-    max_lines: Option<usize>,
+    _max_lines: Option<usize>,
     verbose: u8,
     global_args: &[String],
 ) -> Result<()> {
@@ -150,7 +150,7 @@ fn run_diff(
     let mut final_output = stat_stdout.to_string();
     if !diff_stdout.is_empty() {
         println!("\n--- Changes ---");
-        let compacted = compact_diff(&diff_stdout, max_lines.unwrap_or(500));
+        let compacted = compact_diff(&diff_stdout);
         println!("{}", compacted);
         final_output.push_str("\n--- Changes ---\n");
         final_output.push_str(&compacted);
@@ -168,7 +168,7 @@ fn run_diff(
 
 fn run_show(
     args: &[String],
-    max_lines: Option<usize>,
+    _max_lines: Option<usize>,
     verbose: u8,
     global_args: &[String],
 ) -> Result<()> {
@@ -270,7 +270,7 @@ fn run_show(
         if verbose > 0 {
             println!("\n--- Changes ---");
         }
-        let compacted = compact_diff(diff_text, max_lines.unwrap_or(500));
+        let compacted = compact_diff(diff_text);
         println!("{}", compacted);
         final_output.push_str(&format!("\n{}", compacted));
     }
@@ -290,77 +290,141 @@ fn is_blob_show_arg(arg: &str) -> bool {
     !arg.starts_with('-') && arg.contains(':')
 }
 
-pub(crate) fn compact_diff(diff: &str, max_lines: usize) -> String {
+/// Lock files and minified bundles: machine-generated, often thousands of lines,
+/// and not something an agent reviews line by line.
+fn is_generated_file(path: &str) -> bool {
+    const LOCK_FILES: &[&str] = &[
+        "Cargo.lock",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+        "poetry.lock",
+        "uv.lock",
+        "Pipfile.lock",
+        "Gemfile.lock",
+        "composer.lock",
+        "go.sum",
+        "flake.lock",
+    ];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    LOCK_FILES.contains(&name)
+        || name.ends_with(".min.js")
+        || name.ends_with(".min.css")
+        || name.ends_with(".js.map")
+}
+
+/// Compact a unified diff without losing any change.
+///
+/// Every `+`/`-` line is kept. What gets removed is noise: file headers, git's
+/// 3 lines of unchanged context around each change (trimmed to 1, with `...`
+/// marking the gap), and the bodies of lock/minified files (summarised as +N -M).
+pub(crate) fn compact_diff(diff: &str) -> String {
     let mut result = Vec::new();
     let mut current_file = String::new();
+    let mut generated = false;
+    let mut hidden_generated = false;
     let mut added = 0;
     let mut removed = 0;
     let mut in_hunk = false;
-    let mut hunk_lines = 0;
-    let max_hunk_lines = 30;
-    let mut was_truncated = false;
+    let mut hunk: Vec<&str> = Vec::new();
+
+    let end_file = |result: &mut Vec<String>, generated: bool, added: usize, removed: usize| {
+        if added > 0 || removed > 0 {
+            let note = if generated {
+                " (generated file, lines hidden)"
+            } else {
+                ""
+            };
+            result.push(format!("  +{} -{}{}", added, removed, note));
+        }
+    };
 
     for line in diff.lines() {
         if line.starts_with("diff --git") {
-            // New file
-            if !current_file.is_empty() && (added > 0 || removed > 0) {
-                result.push(format!("  +{} -{}", added, removed));
+            flush_hunk(&hunk, &mut result);
+            hunk.clear();
+            if !current_file.is_empty() {
+                end_file(&mut result, generated, added, removed);
             }
             current_file = line.split(" b/").nth(1).unwrap_or("unknown").to_string();
+            generated = is_generated_file(&current_file);
             result.push(format!("\n{}", current_file));
             added = 0;
             removed = 0;
             in_hunk = false;
         } else if line.starts_with("@@") {
-            // New hunk
+            flush_hunk(&hunk, &mut result);
+            hunk.clear();
             in_hunk = true;
-            hunk_lines = 0;
-            let hunk_info = line.split("@@").nth(1).unwrap_or("").trim();
-            result.push(format!("  @@ {} @@", hunk_info));
+            if !generated {
+                let hunk_info = line.split("@@").nth(1).unwrap_or("").trim();
+                result.push(format!("  @@ {} @@", hunk_info));
+            }
         } else if in_hunk {
-            if line.starts_with('+') && !line.starts_with("+++") {
+            // Inside a hunk every +/- line is a change, including content that
+            // itself starts with "--" or "++" (file headers only precede the first @@).
+            if line.starts_with('+') {
                 added += 1;
-                if hunk_lines < max_hunk_lines {
-                    result.push(format!("  {}", line));
-                    hunk_lines += 1;
-                }
-            } else if line.starts_with('-') && !line.starts_with("---") {
+            } else if line.starts_with('-') {
                 removed += 1;
-                if hunk_lines < max_hunk_lines {
-                    result.push(format!("  {}", line));
-                    hunk_lines += 1;
-                }
-            } else if hunk_lines < max_hunk_lines && !line.starts_with("\\") {
-                // Context line
-                if hunk_lines > 0 {
-                    result.push(format!("  {}", line));
-                    hunk_lines += 1;
-                }
             }
-
-            if hunk_lines == max_hunk_lines {
-                result.push("  ... (truncated)".to_string());
-                hunk_lines += 1;
-                was_truncated = true;
+            if generated {
+                hidden_generated = true;
+            } else {
+                hunk.push(line);
             }
-        }
-
-        if result.len() >= max_lines {
-            result.push("\n... (more changes truncated)".to_string());
-            was_truncated = true;
-            break;
+        } else if line.starts_with("new file mode") {
+            result.push("  (new file)".to_string());
+        } else if line.starts_with("deleted file mode") {
+            result.push("  (deleted)".to_string());
+        } else if let Some(from) = line.strip_prefix("rename from ") {
+            result.push(format!("  (renamed from {})", from));
+        } else if line.starts_with("Binary files ") {
+            result.push("  (binary file changed)".to_string());
         }
     }
 
-    if !current_file.is_empty() && (added > 0 || removed > 0) {
-        result.push(format!("  +{} -{}", added, removed));
+    flush_hunk(&hunk, &mut result);
+    if !current_file.is_empty() {
+        end_file(&mut result, generated, added, removed);
     }
 
-    if was_truncated {
-        result.push("[full diff: contextzip git diff --no-compact]".to_string());
+    if hidden_generated {
+        result.push("[generated files: contextzip git diff --no-compact -- <file>]".to_string());
     }
 
     result.join("\n")
+}
+
+/// Emit one hunk: all changed lines, plus unchanged lines directly next to a change.
+fn flush_hunk(hunk: &[&str], result: &mut Vec<String>) {
+    let is_change = |l: &str| l.starts_with('+') || l.starts_with('-');
+    let n = hunk.len();
+    let mut emitted = false;
+    let mut skipped = false;
+
+    for i in 0..n {
+        let line = hunk[i];
+        if line.starts_with('\\') {
+            continue; // "\ No newline at end of file"
+        }
+        let keep = is_change(line)
+            || (i > 0 && is_change(hunk[i - 1]))
+            || (i + 1 < n && is_change(hunk[i + 1]));
+        if keep {
+            if skipped && emitted {
+                result.push("  ...".to_string());
+            }
+            result.push(format!("  {}", line));
+            emitted = true;
+            skipped = false;
+        } else {
+            skipped = true;
+        }
+    }
 }
 
 fn run_log(
@@ -1421,7 +1485,7 @@ fn run_stash(
                 println!("{}", msg);
                 msg.to_string()
             } else {
-                let compacted = compact_diff(&stdout, 100);
+                let compacted = compact_diff(&stdout);
                 println!("{}", compacted);
                 compacted
             };
@@ -1755,42 +1819,140 @@ mod tests {
 +    println!("hello");
  }
 "#;
-        let result = compact_diff(diff, 100);
+        let result = compact_diff(diff);
         assert!(result.contains("foo.rs"));
-        assert!(result.contains("+"));
+        assert!(result.contains("+    println!(\"hello\");"));
+        assert!(result.contains("+1 -0"));
+    }
+
+    /// Count +/- change lines in the hunks of a raw diff or a compacted diff.
+    fn count_changes(text: &str, compacted: bool) -> usize {
+        let mut in_hunk = false;
+        text.lines()
+            .filter(|l| {
+                let l = if compacted {
+                    l.strip_prefix("  ").unwrap_or(l)
+                } else {
+                    l
+                };
+                if l.starts_with("diff --git") {
+                    in_hunk = false;
+                } else if l.starts_with("@@") {
+                    in_hunk = true;
+                    return false;
+                }
+                in_hunk && (l.starts_with('+') || l.starts_with('-')) && !is_count_summary(l)
+            })
+            .count()
+    }
+
+    /// compact_diff's per-file "+N -M" summary line (not a change line).
+    fn is_count_summary(l: &str) -> bool {
+        let mut parts = l.split_whitespace();
+        let digits = |p: Option<&str>, sign: char| {
+            p.and_then(|p| p.strip_prefix(sign))
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        };
+        digits(parts.next(), '+') && digits(parts.next(), '-')
     }
 
     #[test]
-    fn test_compact_diff_increased_hunk_limit() {
-        // Build a hunk with 25 changed lines — should NOT be truncated with limit 30
+    fn test_compact_diff_never_drops_changes() {
+        // One 200-line hunk plus 20 files: the old 30-line / 500-line caps cut these.
         let mut diff =
-            "diff --git a/big.rs b/big.rs\n--- a/big.rs\n+++ b/big.rs\n@@ -1,25 +1,25 @@\n"
+            "diff --git a/big.rs b/big.rs\n--- a/big.rs\n+++ b/big.rs\n@@ -1,100 +1,100 @@\n"
                 .to_string();
-        for i in 1..=25 {
-            diff.push_str(&format!("+line{}\n", i));
+        for i in 1..=100 {
+            diff.push_str(&format!("-old{}\n+new{}\n", i, i));
         }
-        let result = compact_diff(&diff, 500);
-        assert!(
-            !result.contains("... (truncated)"),
-            "25 lines should not be truncated with max_hunk_lines=30"
-        );
-        assert!(result.contains("+line25"));
-    }
-
-    #[test]
-    fn test_compact_diff_increased_total_limit() {
-        // Build a diff with 150 output result lines across multiple files — should NOT be cut at 100
-        let mut diff = String::new();
-        for f in 1..=5 {
-            diff.push_str(&format!("diff --git a/file{f}.rs b/file{f}.rs\n--- a/file{f}.rs\n+++ b/file{f}.rs\n@@ -1,20 +1,20 @@\n"));
-            for i in 1..=20 {
-                diff.push_str(&format!("+line{f}_{i}\n"));
+        for f in 1..=20 {
+            diff.push_str(&format!(
+                "diff --git a/f{f}.rs b/f{f}.rs\n--- a/f{f}.rs\n+++ b/f{f}.rs\n@@ -1,40 +1,40 @@\n"
+            ));
+            for i in 1..=40 {
+                diff.push_str(&format!("+f{f}_line{i}\n"));
             }
         }
-        let result = compact_diff(&diff, 500);
+        let result = compact_diff(&diff);
+        assert_eq!(count_changes(&diff, false), 1000);
+        assert_eq!(count_changes(&result, true), 1000);
+        assert!(result.contains("+new100"));
+        assert!(result.contains("+f20_line40"));
+        assert!(!result.contains("truncated"));
+    }
+
+    #[test]
+    fn test_compact_diff_trims_context_to_one_line() {
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,11 +1,11 @@\n c1\n c2\n c3\n-old_a\n+new_a\n c4\n c5\n c6\n c7\n-old_b\n+new_b\n c8\n c9\n";
+        let result = compact_diff(diff);
+        let body: Vec<&str> = result
+            .lines()
+            .skip_while(|l| !l.contains("@@"))
+            .skip(1)
+            .take_while(|l| !l.contains("+2 -2"))
+            .collect();
+        assert_eq!(
+            body,
+            vec![
+                "   c3", "  -old_a", "  +new_a", "   c4", "  ...", "   c7", "  -old_b", "  +new_b",
+                "   c8"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compact_diff_counts_lines_starting_with_dashes() {
+        // Removing "-- note" (SQL comment) yields "--- note": still a change, not a header.
+        let diff = "diff --git a/q.sql b/q.sql\n--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,2 @@\n--- note\n+++ note2\n SELECT 1;\n";
+        let result = compact_diff(diff);
+        assert!(result.contains("  --- note"));
+        assert!(result.contains("  +++ note2"));
+        assert!(result.contains("+1 -1"));
+    }
+
+    #[test]
+    fn test_compact_diff_summarises_lock_files_only() {
+        let mut diff = "diff --git a/Cargo.lock b/Cargo.lock\n--- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1,3 +1,3 @@\n".to_string();
+        for i in 0..300 {
+            diff.push_str(&format!("-version = \"0.{i}\"\n+version = \"1.{i}\"\n"));
+        }
+        diff.push_str("diff --git a/src/x.rs b/src/x.rs\n--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1 +1 @@\n-a\n+b\n");
+        let result = compact_diff(&diff);
+        assert!(result.contains("Cargo.lock\n  +300 -300 (generated file, lines hidden)"));
+        assert!(!result.contains("version = "));
+        assert!(result.contains("  -a\n  +b"));
+        assert!(result.contains("--no-compact"));
+    }
+
+    #[test]
+    fn test_compact_diff_notes_new_deleted_renamed_binary() {
+        let diff = "diff --git a/n.rs b/n.rs\nnew file mode 100644\n--- /dev/null\n+++ b/n.rs\n@@ -0,0 +1 @@\n+x\n\
+diff --git a/d.rs b/d.rs\ndeleted file mode 100644\n\
+diff --git a/old.rs b/new.rs\nsimilarity index 100%\nrename from old.rs\nrename to new.rs\n\
+diff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n";
+        let result = compact_diff(diff);
+        assert!(result.contains("n.rs\n  (new file)"));
+        assert!(result.contains("d.rs\n  (deleted)"));
+        assert!(result.contains("new.rs\n  (renamed from old.rs)"));
+        assert!(result.contains("i.png\n  (binary file changed)"));
+    }
+
+    #[test]
+    fn test_compact_diff_savings_on_real_diff() {
+        // Real `git diff` of this repo (v0.2.0 -> v0.3.0 change set, abridged).
+        let input = include_str!("../tests/fixtures/git_diff_raw.txt");
+        let output = compact_diff(input);
+        assert_eq!(
+            count_changes(input, false),
+            count_changes(&output, true),
+            "no change line may be dropped"
+        );
+        let tokens = |s: &str| s.split_whitespace().count();
+        let savings = 100.0 - tokens(&output) as f64 / tokens(input) as f64 * 100.0;
         assert!(
-            !result.contains("more changes truncated"),
-            "5 files × 20 lines should not exceed max_lines=500"
+            savings >= 15.0,
+            "expected >=15% savings, got {:.1}%",
+            savings
         );
     }
 

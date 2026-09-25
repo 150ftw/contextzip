@@ -1,6 +1,6 @@
 [package]
 name = "contextzip"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["Shivam Sharma <ss18244646@gmail.com>"]
 description = "ContextZip - High-performance CLI proxy to minimize LLM token consumption (based on rtk)"

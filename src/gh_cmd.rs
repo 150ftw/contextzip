@@ -1151,7 +1151,7 @@ fn pr_diff(args: &[String], _verbose: u8) -> Result<()> {
         print!("{}", msg);
         msg.to_string()
     } else {
-        let compacted = git::compact_diff(&raw, 500);
+        let compacted = git::compact_diff(&raw);
         println!("{}", compacted);
         compacted
     };
