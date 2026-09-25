@@ -23,6 +23,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
+            update_name: linux-x86_64
           - name: linux-x86_64-musl
             target: x86_64-unknown-linux-musl
             os: ubuntu-latest
@@ -31,10 +32,12 @@ jobs:
             target: aarch64-apple-darwin
             os: macos-latest
             cross: false
+            update_name: darwin-aarch64
           - name: macos-x86_64
             target: x86_64-apple-darwin
             os: macos-latest
             cross: false
+            update_name: darwin-x86_64
           - name: windows-x86_64
             target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -71,11 +74,20 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/contextzip.exe contextzip-${{ matrix.name }}.exe
 
+      # `contextzip update` (src/init.rs) expects contextzip-<os>-<arch>.tar.gz
+      # containing a binary named `contextzip`.
+      - name: Package update tarball
+        if: matrix.update_name
+        run: |
+          tar -czf contextzip-${{ matrix.update_name }}.tar.gz -C target/${{ matrix.target }}/release contextzip
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: contextzip-${{ matrix.name }}
-          path: contextzip-${{ matrix.name }}*
+          path: |
+            contextzip-${{ matrix.name }}*
+            contextzip-*.tar.gz
 
   checksums:
     name: Generate checksums

@@ -1646,8 +1646,18 @@ pub fn run_update(verbose: u8) -> Result<()> {
             .context("Failed to set binary permissions")?;
     }
 
-    // Replace current binary
-    fs::copy(&temp_bin, &current_exe).with_context(|| {
+    // Replace current binary: stage next to it, then rename over it. Writing into
+    // the running executable fails on Linux (ETXTBSY) and can invalidate the code
+    // signature on macOS; a same-directory rename swaps the inode atomically.
+    let staged = current_exe.with_extension("new");
+    fs::copy(&temp_bin, &staged).with_context(|| {
+        format!(
+            "Failed to write {}. Try running with sudo.",
+            staged.display()
+        )
+    })?;
+    fs::rename(&staged, &current_exe).with_context(|| {
+        let _ = fs::remove_file(&staged);
         format!(
             "Failed to replace binary at {}. Try running with sudo.",
             current_exe.display()

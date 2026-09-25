@@ -12,3 +12,5 @@ First release under this repository.
 ### Bug Fixes
 
 * **wget:** rename test to snake_case so `cargo clippy -- -D warnings` passes
+* **update:** replace the binary via rename instead of writing into the running executable (fixed "Text file busy" on Linux)
+* **release:** publish `contextzip-<os>-<arch>.tar.gz` assets that `contextzip update` downloads
